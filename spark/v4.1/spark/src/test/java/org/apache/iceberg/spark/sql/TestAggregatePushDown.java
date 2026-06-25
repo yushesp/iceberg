@@ -975,4 +975,191 @@ public class TestAggregatePushDown extends CatalogTestBase {
     assertEquals(
         "min/max/count push down", expected2, rowsToJava(unboundedPushdownDs.collectAsList()));
   }
+
+  @TestTemplate
+  public void testDistinctPushDownOnIdentityPartitionColumn() {
+    sql("CREATE TABLE %s (id LONG, data INT) USING iceberg PARTITIONED BY (id)", tableName);
+    sql(
+        "INSERT INTO TABLE %s VALUES (1, 11), (1, 22), (2, 33), (2, 44), (3, 55), (3, 66)",
+        tableName);
+
+    String select = "SELECT DISTINCT id FROM %s ORDER BY id";
+    assertAggregatePushedDown(select, true);
+
+    List<Object[]> expected = Lists.newArrayList();
+    expected.add(new Object[] {1L});
+    expected.add(new Object[] {2L});
+    expected.add(new Object[] {3L});
+    assertEquals("distinct partition values", expected, sql(select, tableName));
+  }
+
+  @TestTemplate
+  public void testDistinctPushDownOnMultipleIdentityPartitionColumns() {
+    sql(
+        "CREATE TABLE %s (id LONG, category STRING, data INT) USING iceberg "
+            + "PARTITIONED BY (id, category)",
+        tableName);
+    sql(
+        "INSERT INTO TABLE %s VALUES (1, 'a', 11), (1, 'a', 22), (1, 'b', 33), (2, 'a', 44)",
+        tableName);
+
+    String select = "SELECT DISTINCT id, category FROM %s ORDER BY id, category";
+    assertAggregatePushedDown(select, true);
+
+    List<Object[]> expected = Lists.newArrayList();
+    expected.add(new Object[] {1L, "a"});
+    expected.add(new Object[] {1L, "b"});
+    expected.add(new Object[] {2L, "a"});
+    assertEquals("distinct over multiple partition columns", expected, sql(select, tableName));
+  }
+
+  @TestTemplate
+  public void testDistinctPushDownOnDatePartitionColumn() {
+    sql("CREATE TABLE %s (id LONG, d DATE) USING iceberg PARTITIONED BY (d)", tableName);
+    sql(
+        "INSERT INTO TABLE %s VALUES (1, date('2021-11-10')), (2, date('2021-11-10')), "
+            + "(3, date('2021-11-11'))",
+        tableName);
+
+    String select = "SELECT DISTINCT d FROM %s ORDER BY d";
+    assertAggregatePushedDown(select, true);
+
+    List<Object[]> expected = Lists.newArrayList();
+    expected.add(new Object[] {Date.valueOf("2021-11-10")});
+    expected.add(new Object[] {Date.valueOf("2021-11-11")});
+    assertEquals("distinct date partition values", expected, sql(select, tableName));
+  }
+
+  @TestTemplate
+  public void testGroupByPartitionColumnWithAggregates() {
+    sql("CREATE TABLE %s (id LONG, data INT) USING iceberg PARTITIONED BY (id)", tableName);
+    sql(
+        "INSERT INTO TABLE %s VALUES (1, 11), (1, 22), (2, 33), (2, 44), (3, 55), (3, null)",
+        tableName);
+
+    String select =
+        "SELECT id, count(*), count(data), min(data), max(data) FROM %s GROUP BY id ORDER BY id";
+    assertAggregatePushedDown(select, true);
+
+    List<Object[]> expected = Lists.newArrayList();
+    expected.add(new Object[] {1L, 2L, 2L, 11, 22});
+    expected.add(new Object[] {2L, 2L, 2L, 33, 44});
+    expected.add(new Object[] {3L, 2L, 1L, 55, 55});
+    assertEquals("group by partition column with aggregates", expected, sql(select, tableName));
+  }
+
+  @TestTemplate
+  public void testDistinctPushDownWithPartitionFilter() {
+    sql("CREATE TABLE %s (id LONG, data INT) USING iceberg PARTITIONED BY (id)", tableName);
+    sql("INSERT INTO TABLE %s VALUES (1, 11), (1, 22), (2, 33), (2, 44), (3, 55)", tableName);
+
+    String select = "SELECT DISTINCT id FROM %s WHERE id > 1 ORDER BY id";
+    assertAggregatePushedDown(select, true);
+
+    List<Object[]> expected = Lists.newArrayList();
+    expected.add(new Object[] {2L});
+    expected.add(new Object[] {3L});
+    assertEquals("distinct with partition filter", expected, sql(select, tableName));
+  }
+
+  @TestTemplate
+  public void testDistinctPushDownReturnsNoRowsWhenFilterExcludesAll() {
+    sql("CREATE TABLE %s (id LONG, data INT) USING iceberg PARTITIONED BY (id)", tableName);
+    sql("INSERT INTO TABLE %s VALUES (1, 11), (2, 22)", tableName);
+
+    String select = "SELECT DISTINCT id FROM %s WHERE id > 100 ORDER BY id";
+    assertAggregatePushedDown(select, true);
+
+    assertEquals("distinct over empty result", Lists.newArrayList(), sql(select, tableName));
+  }
+
+  @TestTemplate
+  public void testGroupByNonPartitionColumnNotPushedDown() {
+    sql("CREATE TABLE %s (id LONG, data INT) USING iceberg PARTITIONED BY (id)", tableName);
+    sql("INSERT INTO TABLE %s VALUES (1, 11), (1, 22), (2, 33), (2, 11)", tableName);
+
+    String select = "SELECT data, count(*) FROM %s GROUP BY data ORDER BY data";
+    assertAggregatePushedDown(select, false);
+
+    List<Object[]> expected = Lists.newArrayList();
+    expected.add(new Object[] {11, 2L});
+    expected.add(new Object[] {22, 1L});
+    expected.add(new Object[] {33, 1L});
+    assertEquals(
+        "group by non-partition column falls back to scan", expected, sql(select, tableName));
+  }
+
+  @TestTemplate
+  public void testGroupByNonIdentityPartitionTransformNotPushedDown() {
+    sql(
+        "CREATE TABLE %s (id LONG, data INT) USING iceberg PARTITIONED BY (bucket(4, id))",
+        tableName);
+    sql("INSERT INTO TABLE %s VALUES (1, 11), (2, 22), (3, 33), (1, 44)", tableName);
+
+    String select = "SELECT DISTINCT id FROM %s ORDER BY id";
+    assertAggregatePushedDown(select, false);
+
+    List<Object[]> expected = Lists.newArrayList();
+    expected.add(new Object[] {1L});
+    expected.add(new Object[] {2L});
+    expected.add(new Object[] {3L});
+    assertEquals(
+        "distinct on bucket-partitioned column falls back to scan",
+        expected,
+        sql(select, tableName));
+  }
+
+  @TestTemplate
+  public void testGroupByNotPushedDownWithDataFilter() {
+    sql("CREATE TABLE %s (id LONG, data INT) USING iceberg PARTITIONED BY (id)", tableName);
+    sql("INSERT INTO TABLE %s VALUES (1, 11), (1, 22), (2, 33), (2, 44), (3, 55)", tableName);
+
+    // A residual filter on a non-partition column is not fully pushed, so the aggregate is not
+    // pushed down either; results must still be correct from a regular scan.
+    String select = "SELECT id, count(*) FROM %s WHERE data > 20 GROUP BY id ORDER BY id";
+    assertAggregatePushedDown(select, false);
+
+    List<Object[]> expected = Lists.newArrayList();
+    expected.add(new Object[] {1L, 1L});
+    expected.add(new Object[] {2L, 2L});
+    expected.add(new Object[] {3L, 1L});
+    assertEquals("data filter prevents group by pushdown", expected, sql(select, tableName));
+  }
+
+  @TestTemplate
+  public void testDistinctNotPushedDownWhenSomeFilesPredateIdentityPartition() {
+    sql("CREATE TABLE %s (id LONG, data INT) USING iceberg", tableName);
+    // these rows are written under the unpartitioned spec
+    sql("INSERT INTO TABLE %s VALUES (1, 11), (2, 22)", tableName);
+    // evolve the spec to identity-partition by id, then refresh so Spark sees the new spec
+    validationCatalog.loadTable(tableIdent).updateSpec().addField("id").commit();
+    sql("REFRESH TABLE %s", tableName);
+    // these rows are written under the identity-partitioned spec
+    sql("INSERT INTO TABLE %s VALUES (2, 33), (3, 44)", tableName);
+
+    String select = "SELECT DISTINCT id FROM %s ORDER BY id";
+    // the pre-evolution files are not partitioned by id, so the values cannot all come from
+    // metadata and pushdown must be skipped
+    assertAggregatePushedDown(select, false);
+
+    List<Object[]> expected = Lists.newArrayList();
+    expected.add(new Object[] {1L});
+    expected.add(new Object[] {2L});
+    expected.add(new Object[] {3L});
+    assertEquals("mixed partition specs fall back to scan", expected, sql(select, tableName));
+  }
+
+  private void assertAggregatePushedDown(String query, boolean shouldPushDown) {
+    String explainString =
+        sql("EXPLAIN " + query, tableName).get(0)[0].toString().toLowerCase(Locale.ROOT);
+    if (shouldPushDown) {
+      assertThat(explainString)
+          .as("aggregate should be pushed down to a metadata-only local scan")
+          .contains("localtablescan");
+    } else {
+      assertThat(explainString)
+          .as("aggregate should not be pushed down")
+          .doesNotContain("localtablescan");
+    }
+  }
 }
